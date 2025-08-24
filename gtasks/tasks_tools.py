@@ -6,7 +6,7 @@ This module provides MCP tools for interacting with Google Tasks API.
 
 import logging
 import asyncio
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 from googleapiclient.errors import HttpError
 
@@ -16,6 +16,9 @@ from core.utils import handle_http_errors
 
 logger = logging.getLogger(__name__)
 
+LIST_TASKS_MAX_RESULTS_DEFAULT = 20
+LIST_TASKS_MAX_RESULTS_MAX = 10_000
+LIST_TASKS_MAX_POSITION = "99999999999999999999"
 
 @server.tool()
 @require_google_service("tasks", "tasks_read")
@@ -23,7 +26,7 @@ logger = logging.getLogger(__name__)
 async def list_task_lists(
     service,
     user_google_email: str,
-    max_results: Optional[int] = None,
+    max_results: Optional[str] = None,
     page_token: Optional[str] = None
 ) -> str:
     """
@@ -31,7 +34,7 @@ async def list_task_lists(
 
     Args:
         user_google_email (str): The user's Google email address. Required.
-        max_results (Optional[int]): Maximum number of task lists to return (default: 1000, max: 1000).
+        max_results (Optional[str]): Maximum number of task lists to return (default: 1000, max: 1000).
         page_token (Optional[str]): Token for pagination.
 
     Returns:
@@ -266,12 +269,12 @@ async def list_tasks(
     service,
     user_google_email: str,
     task_list_id: str,
-    max_results: Optional[int] = None,
+    max_results: int = None,
     page_token: Optional[str] = None,
-    show_completed: Optional[bool] = None,
-    show_deleted: Optional[bool] = None,
-    show_hidden: Optional[bool] = None,
-    show_assigned: Optional[bool] = None,
+    show_completed: bool = None,
+    show_deleted: bool = None,
+    show_hidden: bool = None,
+    show_assigned: bool = None,
     completed_max: Optional[str] = None,
     completed_min: Optional[str] = None,
     due_max: Optional[str] = None,
@@ -284,12 +287,12 @@ async def list_tasks(
     Args:
         user_google_email (str): The user's Google email address. Required.
         task_list_id (str): The ID of the task list to retrieve tasks from.
-        max_results (Optional[int]): Maximum number of tasks to return (default: 20, max: 100).
+        max_results (Optional[int]): Maximum number of tasks to return. (default: 20, max: 10000).
         page_token (Optional[str]): Token for pagination.
-        show_completed (Optional[bool]): Whether to include completed tasks (default: True).
-        show_deleted (Optional[bool]): Whether to include deleted tasks (default: False).
-        show_hidden (Optional[bool]): Whether to include hidden tasks (default: False).
-        show_assigned (Optional[bool]): Whether to include assigned tasks (default: False).
+        show_completed (bool): Whether to include completed tasks (default: True).
+        show_deleted (bool): Whether to include deleted tasks (default: False).
+        show_hidden (bool): Whether to include hidden tasks (default: False).
+        show_assigned (bool): Whether to include assigned tasks (default: False).
         completed_max (Optional[str]): Upper bound for completion date (RFC 3339 timestamp).
         completed_min (Optional[str]): Lower bound for completion date (RFC 3339 timestamp).
         due_max (Optional[str]): Upper bound for due date (RFC 3339 timestamp).
@@ -333,8 +336,30 @@ async def list_tasks(
         tasks = result.get("items", [])
         next_page_token = result.get("nextPageToken")
 
+        # In order to return a sorted and organized list of tasks all at once, we support retrieving more than a single
+        # page from the Google tasks API.
+        results_remaining = (
+            min(max_results, LIST_TASKS_MAX_RESULTS_MAX) if max_results else LIST_TASKS_MAX_RESULTS_DEFAULT
+        )
+        results_remaining -= len(tasks)
+        while results_remaining > 0 and next_page_token:
+            params["pageToken"] = next_page_token
+            params["maxResults"] = str(results_remaining)
+            result = await asyncio.to_thread(
+                service.tasks().list(**params).execute
+            )
+            more_tasks = result.get("items", [])
+            next_page_token = result.get("nextPageToken")
+            if len(more_tasks) == 0:
+                # For some unexpected reason, no more tasks were returned. Break to avoid an infinite loop.
+                break
+            tasks.extend(more_tasks)
+            results_remaining -= len(more_tasks)
+
         if not tasks:
             return f"No tasks found in task list {task_list_id} for {user_google_email}."
+
+        orphaned_subtasks = sort_tasks_by_position(tasks)
 
         response = f"Tasks in list {task_list_id} for {user_google_email}:\n"
         for task in tasks:
@@ -350,7 +375,12 @@ async def list_tasks(
             response += "\n"
 
         if next_page_token:
-            response += f"Next page token: {next_page_token}"
+            response += f"Next page token: {next_page_token}\n"
+        if orphaned_subtasks > 0:
+            response += "\n"
+            response += f"{orphaned_subtasks} orphaned subtasks could not be placed in order due to missing parent information. They were listed at the end of the task list.\n"
+            response += "This can occur due to pagination. Callers can often avoid this problem if max_results is large enough to contain all tasks (subtasks and their parents) without paging.\n"
+            response += "This can also occur due to filtering that excludes parent tasks while including their subtasks or due to deleted or hidden parent tasks.\n"
 
         logger.info(f"Found {len(tasks)} tasks in list {task_list_id} for {user_google_email}")
         return response
@@ -363,6 +393,45 @@ async def list_tasks(
         message = f"Unexpected error: {e}."
         logger.exception(message)
         raise Exception(message)
+
+
+def sort_tasks_by_position(tasks: List[Dict[str, str]]) -> int:
+    """
+    Sort tasks to match the order in which they are displayed in the Google Tasks UI according to:
+    1. parent: Subtasks should be listed immediately following their parent task.
+    2. position: The position field determines the order of tasks at the same level.
+
+    Args:
+        tasks (list): List of task dictionaries to sort in place (modified).
+
+    Returns:
+        int: The number of orphaned subtasks encountered in the list.
+    """
+    parent_positions = {
+        task["id"]: task["position"] for task in tasks if task.get("parent") is None
+    }
+
+    orphaned_subtasks = 0
+
+    def get_sort_key(task: Dict[str, str]) -> Tuple[str, str, str]:
+        nonlocal orphaned_subtasks
+
+        parent = task.get("parent")
+        position = task["position"]
+        if parent is None:
+            return (task["position"], "", "")
+        else:
+            # Note that, due to paging or filtering, a subtask may have a parent that is not present in the list of tasks.
+            # We will return these orphaned subtasks at the end of the list, grouped by their parent task IDs.
+            parent_position = parent_positions.get(parent)
+            if parent_position is None:
+                orphaned_subtasks += 1
+                logger.debug(f"Orphaned task: {task['title']}, id = {task['id']}, parent = {parent}")
+                return (f"{LIST_TASKS_MAX_POSITION}", parent, position)
+            return (parent_position, position, "")
+
+    tasks.sort(key=get_sort_key)
+    return orphaned_subtasks
 
 
 @server.tool()

@@ -80,6 +80,10 @@ env:
   # For external access: "https://your-domain.com" or "http://your-ingress-host"
   WORKSPACE_MCP_BASE_URI: ""
   
+  # External URL for reverse proxy setups (e.g., "https://your-domain.com")
+  # If set, this overrides the base_uri:port combination for OAuth endpoints
+  WORKSPACE_EXTERNAL_URL: ""
+  
   # OAuth 2.1 support
   MCP_ENABLE_OAUTH21: "false"
   
@@ -107,8 +111,20 @@ tools:
   # Example: ["gmail", "drive", "calendar"]
   # Leave empty to enable all tools
 
+# Tool tier selection - alternative to specifying individual tools
+# Options: core, extended, complete
+# Leave empty to use default or tools.enabled configuration
+toolTier: ""
+
 # Single-user mode configuration
 singleUserMode: false
+
+# Command configuration
+command:
+  # Set disableArgs to true to remove the args section entirely (uses Dockerfile defaults)
+  disableArgs: false
+  # Override the entire command if needed
+  override: []
 
 # Health check configuration
 healthCheck:

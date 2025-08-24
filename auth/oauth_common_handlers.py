@@ -14,9 +14,9 @@ from starlette.responses import JSONResponse, RedirectResponse
 from google.oauth2.credentials import Credentials
 
 from auth.oauth21_session_store import store_token_session
-from auth.google_auth import save_credentials_to_file
+from auth.google_auth import get_credential_store
 from auth.scopes import get_current_scopes
-from auth.oauth_config import get_oauth_config
+from auth.oauth_config import get_oauth_config, is_stateless_mode
 from auth.oauth_error_handling import (
     OAuthError, OAuthValidationError, OAuthConfigurationError,
     create_oauth_error_response, validate_token_request,
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 async def handle_oauth_authorize(request: Request):
     """Common handler for OAuth authorization proxy."""
     origin = request.headers.get("origin")
-    
+
     if request.method == "OPTIONS":
         cors_headers = get_development_cors_headers(origin)
         return JSONResponse(content={}, headers=cors_headers)
@@ -69,7 +69,7 @@ async def handle_oauth_authorize(request: Request):
 async def handle_proxy_token_exchange(request: Request):
     """Common handler for OAuth token exchange proxy with comprehensive error handling."""
     origin = request.headers.get("origin")
-    
+
     if request.method == "OPTIONS":
         cors_headers = get_development_cors_headers(origin)
         return JSONResponse(content={}, headers=cors_headers)
@@ -180,9 +180,15 @@ async def handle_proxy_token_exchange(request: Request):
                                             expiry=expiry
                                         )
 
-                                        # Save credentials to file for legacy auth
-                                        save_credentials_to_file(user_email, credentials)
-                                        logger.info(f"Saved Google credentials for {user_email}")
+                                        # Save credentials to file for legacy auth (skip in stateless mode)
+                                        if not is_stateless_mode():
+                                            store = get_credential_store()
+                                            if not store.store_credential(user_email, credentials):
+                                                logger.error(f"Failed to save Google credentials for {user_email}")
+                                            else:
+                                                logger.info(f"Saved Google credentials for {user_email}")
+                                        else:
+                                            logger.info(f"Skipping credential file save in stateless mode for {user_email}")
                                 except jwt.ExpiredSignatureError:
                                     logger.error("ID token has expired - cannot extract user email")
                                 except jwt.InvalidTokenError as e:
@@ -200,7 +206,7 @@ async def handle_proxy_token_exchange(request: Request):
                     "Cache-Control": "no-store"
                 }
                 response_headers.update(cors_headers)
-                
+
                 return JSONResponse(
                     status_code=response.status,
                     content=response_data,
@@ -227,7 +233,7 @@ async def handle_oauth_protected_resource(request: Request):
     Handle OAuth protected resource metadata requests.
     """
     origin = request.headers.get("origin")
-    
+
     # Handle preflight
     if request.method == "OPTIONS":
         cors_headers = get_development_cors_headers(origin)
@@ -238,6 +244,7 @@ async def handle_oauth_protected_resource(request: Request):
 
     # For streamable-http transport, the MCP server runs at /mcp
     # This is the actual resource being protected
+    # As of August, /mcp is now the proper base - prior was /mcp/
     resource_url = f"{base_url}/mcp"
 
     # Build metadata response per RFC 9449
@@ -250,7 +257,6 @@ async def handle_oauth_protected_resource(request: Request):
         "client_registration_required": True,
         "client_configuration_endpoint": f"{base_url}/.well-known/oauth-client",
     }
-
     # Log the response for debugging
     logger.debug(f"Returning protected resource metadata: {metadata}")
 
@@ -261,7 +267,7 @@ async def handle_oauth_protected_resource(request: Request):
         "Cache-Control": "public, max-age=3600"
     }
     response_headers.update(cors_headers)
-    
+
     return JSONResponse(
         content=metadata,
         headers=response_headers
@@ -273,13 +279,13 @@ async def handle_oauth_authorization_server(request: Request):
     Handle OAuth authorization server metadata.
     """
     origin = request.headers.get("origin")
-    
+
     if request.method == "OPTIONS":
         cors_headers = get_development_cors_headers(origin)
         return JSONResponse(content={}, headers=cors_headers)
 
     config = get_oauth_config()
-    
+
     # Get authorization server metadata from centralized config
     # Pass scopes directly to keep all metadata generation in one place
     metadata = config.get_authorization_server_metadata(scopes=get_current_scopes())
@@ -293,7 +299,7 @@ async def handle_oauth_authorization_server(request: Request):
         "Cache-Control": "public, max-age=3600"
     }
     response_headers.update(cors_headers)
-    
+
     return JSONResponse(
         content=metadata,
         headers=response_headers
@@ -303,7 +309,7 @@ async def handle_oauth_authorization_server(request: Request):
 async def handle_oauth_client_config(request: Request):
     """Common handler for OAuth client configuration."""
     origin = request.headers.get("origin")
-    
+
     if request.method == "OPTIONS":
         cors_headers = get_development_cors_headers(origin)
         return JSONResponse(content={}, headers=cors_headers)
@@ -327,7 +333,6 @@ async def handle_oauth_client_config(request: Request):
             "client_uri": config.base_url,
             "redirect_uris": [
                 f"{config.base_url}/oauth2callback",
-                "http://localhost:5173/auth/callback"
             ],
             "grant_types": ["authorization_code", "refresh_token"],
             "response_types": ["code"],
@@ -346,7 +351,7 @@ async def handle_oauth_client_config(request: Request):
 async def handle_oauth_register(request: Request):
     """Common handler for OAuth dynamic client registration with comprehensive error handling."""
     origin = request.headers.get("origin")
-    
+
     if request.method == "OPTIONS":
         cors_headers = get_development_cors_headers(origin)
         return JSONResponse(content={}, headers=cors_headers)
